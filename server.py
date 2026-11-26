@@ -45,7 +45,7 @@ OUTPUT_ROOT = ROOT / "output" / "jobs"
 CACHE_ROOT = ROOT / "output" / "cache"
 RESULT_CACHE_ROOT = ROOT / "output" / "cache" / "results"
 IMAGE_CACHE_ROOT = ROOT / "output" / "cache" / "images"
-LITE_MODEL_FILENAME = "model-lite-v1.glb"
+LITE_MODEL_FILENAME = "model-lite-v2.glb"
 LITE_MIN_RAW_BYTES = 4 * 1024 * 1024
 LITE_MAX_TEXTURE_SIZE = int(os.environ.get("CUSTOMDIY_LITE_MAX_TEXTURE", "1536"))
 JOB_TTL_SECONDS = int(os.environ.get("CUSTOMDIY_JOB_TTL_SECONDS", str(24 * 3600)))
@@ -55,7 +55,7 @@ MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_MODEL_BYTES = 80 * 1024 * 1024
 MAX_REQUEST_BYTES = MAX_IMAGE_BYTES * 6
 DEFAULT_GARMENT_COLOR = "#234c43"
-FIT_ALGO_VERSION = "2026-11-05-bounds"
+FIT_ALGO_VERSION = "2026-11-26-auto-yaw"
 INTERNAL_TOKEN = os.environ.get("CUSTOMDIY_BLENDER_TOKEN", "").strip()
 BIND_HOST = os.environ.get("CUSTOMDIY_BLENDER_HOST", "0.0.0.0").strip() or "0.0.0.0"
 BIND_PORT = int(os.environ.get("CUSTOMDIY_BLENDER_PORT", "8765"))
@@ -648,7 +648,7 @@ class DemoHandler(SimpleHTTPRequestHandler):
                 return
             self.send_response(HTTPStatus.FOUND)
             self.send_header("Location", public_url)
-            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", "0")
             super().end_headers()

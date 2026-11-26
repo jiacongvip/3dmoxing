@@ -853,7 +853,7 @@ function loadPreviewBaseModel(config, options = {}) {
     hideLoadingOnReady = true,
   } = options;
   return loadGltfUrl(
-    `/api/model?url=${encodeURIComponent(config.model)}`,
+    `/api/model?v=2&url=${encodeURIComponent(config.model)}`,
     (event) => {
       if (!event.total) return;
       const percent = Math.round((event.loaded / event.total) * 100);

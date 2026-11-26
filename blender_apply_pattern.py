@@ -119,8 +119,85 @@ def stand_model_up(obj: bpy.types.Object) -> str:
     return "z_to_y"
 
 
-def restore_export_up_axis(axis: str, only_objects: list[bpy.types.Object] | None = None) -> None:
+def detect_sideways_front_yaw(obj: bpy.types.Object) -> float:
+    """若白胚在 Y-up 空间里明显侧身摆放（Z 宽 > X 宽 * 1.25），通过领口凹陷判断正面朝向并返回绕 Y 轴旋转角度（±90°）。"""
+    minimum, maximum = local_bounds(obj)
+    size = maximum - minimum
+    if size.x <= 1e-6 or size.z <= size.x * 1.25:
+        return 0.0
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    bvh = BVHTree.FromObject(obj, depsgraph)
+    if bvh is None:
+        return -90.0
+    center_z = float(minimum.z + maximum.z) * 0.5
+    ray_dist = float(size.x) * 2.0 + 0.2
+
+    def side_collar_drop(from_pos_x: bool) -> float:
+        origin_x = float(maximum.x) + float(size.x) * 0.25 if from_pos_x else float(minimum.x) - float(size.x) * 0.25
+        direction = Vector((-1.0 if from_pos_x else 1.0, 0.0, 0.0))
+        chest_vals: list[float] = []
+        collar_vals: list[float] = []
+        for idx in range(20):
+            frac = 0.78 + 0.19 * idx / 19.0
+            y = float(minimum.y) + float(size.y) * frac
+            loc, _norm, _fidx, _dist = bvh.ray_cast(Vector((origin_x, y, center_z)), direction, ray_dist)
+            if loc is None:
+                continue
+            val = float(loc.x)
+            if frac <= 0.86:
+                chest_vals.append(val)
+            elif frac >= 0.91:
+                collar_vals.append(val)
+        if not chest_vals or not collar_vals:
+            return 0.0
+        chest_ref = float(np.median(chest_vals))
+        if from_pos_x:
+            # +X 为正面时，领口处射线穿过前领口打到后领内壁，loc.x 明显变小
+            return chest_ref - min(collar_vals)
+        # -X 为正面时，领口处 loc.x 明显变大
+        return max(collar_vals) - chest_ref
+
+    pos_drop = side_collar_drop(True)
+    neg_drop = side_collar_drop(False)
+    yaw_deg = -90.0 if pos_drop >= neg_drop else 90.0
+    print(
+        "AUTO_FRONT_YAW",
+        {
+            "before_dx_dz": [round(float(size.x), 4), round(float(size.z), 4)],
+            "pos_x_drop": round(pos_drop, 4),
+            "neg_x_drop": round(neg_drop, 4),
+            "yaw_deg": yaw_deg,
+        },
+    )
+    return yaw_deg
+
+
+def rotate_meshes_y(yaw_deg: float, only_objects: list[bpy.types.Object] | None = None) -> None:
+    if abs(yaw_deg) < 1e-3:
+        return
+    rotation = Matrix.Rotation(math.radians(yaw_deg), 4, "Y")
+    seen = set()
+    targets = only_objects if only_objects is not None else list(bpy.context.scene.objects)
+    for obj in targets:
+        if obj.type != "MESH":
+            continue
+        mesh = obj.data
+        key = mesh.as_pointer()
+        if key in seen:
+            continue
+        seen.add(key)
+        mesh.transform(rotation)
+        mesh.update()
+
+
+def restore_export_up_axis(
+    axis: str,
+    only_objects: list[bpy.types.Object] | None = None,
+    undo_yaw_deg: float = 0.0,
+) -> None:
     """导出前转回导入时的姿态。否则 glTF 会再转一次，预览里衣服就横躺着。"""
+    if abs(undo_yaw_deg) >= 1e-3:
+        rotate_meshes_y(-undo_yaw_deg, only_objects=only_objects)
     if axis != "z_to_y":
         return
     rotation = Matrix.Rotation(math.radians(90.0), 4, "X")
@@ -1741,9 +1818,15 @@ def patch_glb_garment_color(path: Path, material_names: list[str], color: str) -
 
 
 def optimize_base_model(input_path: Path, output_path: Path, max_texture_size: int = 1536) -> None:
-    """将原始大白胚压缩为适合手机端秒开的轻量 GLB（限制贴图尺寸 + JPEG + Draco 网格压缩）。"""
+    """将原始大白胚压缩为适合手机端秒开的轻量 GLB（自动摆正侧身朝向 + 限制贴图尺寸 + JPEG + Draco 网格压缩）。"""
     reset_scene()
-    import_model(input_path)
+    target = import_model(input_path)
+    up_axis = stand_model_up(target)
+    yaw_deg = detect_sideways_front_yaw(target)
+    if abs(yaw_deg) >= 1e-3:
+        rotate_meshes_y(yaw_deg)
+    # 仅还原 up_axis，保留正面朝 +Z 的朝向修正
+    restore_export_up_axis(up_axis)
     max_dim = max(512, min(4096, int(max_texture_size)))
     scaled_count = 0
     for image in bpy.data.images:
@@ -1844,6 +1927,9 @@ def main() -> None:
     reset_scene()
     target = import_model(args.input)
     up_axis = stand_model_up(target)
+    yaw_deg = detect_sideways_front_yaw(target)
+    if abs(yaw_deg) >= 1e-3:
+        rotate_meshes_y(yaw_deg)
     if not args.decals_only:
         remove_merged_scan_side_fills()
         material_name = ensure_side_fill_material(target)
@@ -2008,10 +2094,10 @@ def main() -> None:
                 continue
             raise
     if args.decals_only:
-        restore_export_up_axis(up_axis, only_objects=decal_objects)
+        restore_export_up_axis(up_axis, only_objects=decal_objects, undo_yaw_deg=yaw_deg)
         export_decals_only(args.output, decal_objects)
     else:
-        restore_export_up_axis(up_axis)
+        restore_export_up_axis(up_axis, undo_yaw_deg=0.0)
         export_model(args.output, material_names, args.garment_color, use_draco=args.draco)
     print("OUTPUT_GLB", args.output.resolve())
 
