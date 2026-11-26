@@ -1,0 +1,24 @@
+# 独立于商城主 docker-compose。宝塔执行：bash install.sh
+# 用 host 网络，避免宝塔防火墙冲掉 Docker 网桥导致起不来。
+
+services:
+  customdiy-blender:
+    build: .
+    image: customdiy-blender:4.5
+    container_name: customdiy_blender
+    network_mode: host
+    environment:
+      CUSTOMDIY_BLENDER_HOST: 0.0.0.0
+      CUSTOMDIY_BLENDER_PORT: 8765
+      CUSTOMDIY_BLENDER_TOKEN: ${CUSTOMDIY_BLENDER_TOKEN:-}
+    volumes:
+      - ./output:/app/output
+      - ./server.py:/app/server.py
+      - ./app.js:/app/app.js
+      - ./styles.css:/app/styles.css
+      - ./index.html:/app/index.html
+      - ./blender_apply_pattern.py:/app/blender_apply_pattern.py
+      - ./assets/loading-logo.jpg:/app/assets/loading-logo.jpg
+    shm_size: "2gb"
+    command: ["python", "server.py"]
+    restart: unless-stopped

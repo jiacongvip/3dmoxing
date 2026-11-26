@@ -1,0 +1,20 @@
+宝塔安装（和商城同一台即可）
+
+1. 软件商店先装 Docker
+2. 解压到网站目录，例如 /www/wwwroot/3d.com/clothing-3d-demo
+3. 终端执行：
+   cd /www/wwwroot/3d.com/clothing-3d-demo
+   bash install.sh
+4. 不要用浏览器直接开 服务器IP:8765（阿里云默认拦这个端口）
+5. 宝塔网站 3d.com → 设置 → 反向代理，目标填：
+   http://127.0.0.1:8765
+   然后浏览器打开 http://3d.com
+6. 商城后台：个性定制 → 售卖设置
+   打开 3D 预览
+   地址填 http://127.0.0.1:8765
+   （3D 和商城不在同一台时，填 http://3d.com ）
+   点「测一下」，通了保存
+
+装好后先在服务器上测：
+   curl http://127.0.0.1:8765/api/health
+看到 generator_ready 为 true 才算服务起来了。

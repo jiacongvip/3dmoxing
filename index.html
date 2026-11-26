@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#f1f0eb" />
+    <title>定制服装 3D 预览</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%23203f38'/%3E%3Cpath d='M9 9h4M19 9h4M9 23h4M19 23h4M9 9v4M23 9v4M9 19v4M23 19v4' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="./styles.css?v=26" />
+    <script src="./vendor/lucide.min.js" defer></script>
+    <script type="module" src="./app.js?v=28"></script>
+  </head>
+  <body>
+    <main class="viewer-shell" id="viewerShell">
+      <div class="scene" id="scene" aria-label="3D 服装预览区"></div>
+
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"><i data-lucide="scan-line"></i></span>
+          <span class="brand-name">定制服装</span>
+          <span class="brand-divider" aria-hidden="true"></span>
+          <span class="brand-section">3D 预览</span>
+        </div>
+
+        <div class="top-actions">
+          <span class="model-status" id="modelStatus">
+            <span class="status-dot" aria-hidden="true"></span>
+            模拟模型
+          </span>
+          <button class="command-button" id="openModelButton" type="button">
+            <i data-lucide="folder-up" aria-hidden="true"></i>
+            <span>导入 GLB</span>
+          </button>
+          <input id="modelInput" type="file" accept=".glb,model/gltf-binary" hidden />
+        </div>
+      </header>
+
+      <section class="product-summary" aria-labelledby="productTitle">
+        <p class="eyebrow">3D 定制样衣</p>
+        <h1 id="productTitle">经典短袖 POLO</h1>
+        <div class="product-meta">
+          <span>男款</span>
+          <span aria-hidden="true">/</span>
+          <span>M 码</span>
+          <span aria-hidden="true">/</span>
+          <span id="fabricMeta">柔棉</span>
+        </div>
+      </section>
+
+      <aside class="viewer-tools" aria-label="查看工具">
+        <button
+          class="icon-button is-active"
+          id="autoRotateButton"
+          type="button"
+          aria-label="暂停自动旋转"
+          aria-pressed="true"
+          data-tooltip="自动旋转"
+        >
+          <i data-lucide="refresh-cw" aria-hidden="true"></i>
+        </button>
+        <button
+          class="icon-button"
+          id="resetButton"
+          type="button"
+          aria-label="重置视角"
+          data-tooltip="重置视角"
+        >
+          <i data-lucide="rotate-ccw" aria-hidden="true"></i>
+        </button>
+        <button
+          class="icon-button"
+          id="captureButton"
+          type="button"
+          aria-label="保存当前视图"
+          data-tooltip="保存图片"
+        >
+          <i data-lucide="camera" aria-hidden="true"></i>
+        </button>
+        <button
+          class="icon-button"
+          id="fullscreenButton"
+          type="button"
+          aria-label="进入全屏"
+          data-tooltip="全屏"
+        >
+          <i data-lucide="maximize" aria-hidden="true"></i>
+        </button>
+      </aside>
+
+      <section class="customization-panel" aria-label="服装配置">
+        <div class="option-group color-group">
+          <span class="option-label">颜色</span>
+          <div class="color-options" id="colorOptions" role="radiogroup" aria-label="服装颜色">
+            <button
+              class="color-swatch is-selected"
+              type="button"
+              style="--swatch: #234c43"
+              data-color="#234c43"
+              data-name="松柏绿"
+              role="radio"
+              aria-checked="true"
+              aria-label="松柏绿"
+            ></button>
+            <button
+              class="color-swatch"
+              type="button"
+              style="--swatch: #202326"
+              data-color="#202326"
+              data-name="曜石黑"
+              role="radio"
+              aria-checked="false"
+              aria-label="曜石黑"
+            ></button>
+            <button
+              class="color-swatch color-swatch--light"
+              type="button"
+              style="--swatch: #e8e5dc"
+              data-color="#e8e5dc"
+              data-name="燕麦白"
+              role="radio"
+              aria-checked="false"
+              aria-label="燕麦白"
+            ></button>
+            <button
+              class="color-swatch"
+              type="button"
+              style="--swatch: #6b2638"
+              data-color="#6b2638"
+              data-name="勃艮第红"
+              role="radio"
+              aria-checked="false"
+              aria-label="勃艮第红"
+            ></button>
+            <button
+              class="color-swatch"
+              type="button"
+              style="--swatch: #2f4b68"
+              data-color="#2f4b68"
+              data-name="深海蓝"
+              role="radio"
+              aria-checked="false"
+              aria-label="深海蓝"
+            ></button>
+          </div>
+        </div>
+
+        <div class="panel-divider" aria-hidden="true"></div>
+
+        <div class="option-group material-group">
+          <span class="option-label">面料</span>
+          <div class="segmented-control" id="fabricOptions" role="radiogroup" aria-label="面料类型">
+            <button class="segment is-selected" type="button" data-fabric="cotton" role="radio" aria-checked="true">柔棉</button>
+            <button class="segment" type="button" data-fabric="knit" role="radio" aria-checked="false">精纺</button>
+            <button class="segment" type="button" data-fabric="performance" role="radio" aria-checked="false">速干</button>
+          </div>
+        </div>
+
+        <div class="panel-divider" aria-hidden="true"></div>
+
+        <div class="option-group pattern-group">
+          <span class="option-label">图案</span>
+          <div class="pattern-controls">
+            <div class="pattern-placement" id="patternPlacement" role="radiogroup" aria-label="印花位置">
+              <button class="pattern-placement-option is-selected" type="button" data-placement="front" role="radio" aria-checked="true">正面</button>
+              <button class="pattern-placement-option" type="button" data-placement="back" role="radio" aria-checked="false">背面</button>
+              <button class="pattern-placement-option" type="button" data-placement="left_sleeve" role="radio" aria-checked="false">左袖</button>
+              <button class="pattern-placement-option" type="button" data-placement="right_sleeve" role="radio" aria-checked="false">右袖</button>
+              <button class="pattern-placement-option" type="button" data-placement="pants" role="radio" aria-checked="false">下装</button>
+              <button class="pattern-placement-option" type="button" data-placement="pants_back" role="radio" aria-checked="false">下装背面</button>
+            </div>
+            <button class="pattern-upload-button" id="patternUploadButton" type="button">
+              <i data-lucide="image-up" aria-hidden="true"></i>
+              <span id="patternButtonLabel">添加图案</span>
+            </button>
+            <button class="pattern-remove-button" id="patternRemoveButton" type="button" aria-label="删除图案" disabled>
+              <i data-lucide="trash-2" aria-hidden="true"></i>
+            </button>
+            <input id="patternInput" type="file" accept="image/png,image/jpeg,image/webp" hidden />
+          </div>
+          <div class="pattern-adjustments" aria-label="图案大小和位置">
+            <label class="pattern-adjustment" for="patternSizeInput">
+              <span>大小</span>
+              <input id="patternSizeInput" type="range" min="0.55" max="1.8" step="0.05" value="1" disabled />
+              <output id="patternSizeValue" for="patternSizeInput">100%</output>
+            </label>
+            <label class="pattern-adjustment" for="patternPositionXInput">
+              <span id="patternPositionXLabel">左右</span>
+              <input id="patternPositionXInput" type="range" min="-1" max="1" step="0.05" value="0.4" disabled />
+              <output id="patternPositionXValue" for="patternPositionXInput">右 40%</output>
+            </label>
+            <label class="pattern-adjustment" for="patternPositionYInput">
+              <span>上下</span>
+              <input id="patternPositionYInput" type="range" min="-1" max="1" step="0.05" value="0.2" disabled />
+              <output id="patternPositionYValue" for="patternPositionYInput">上 20%</output>
+            </label>
+          </div>
+        </div>
+
+        <button class="save-button" id="saveButton" type="button" disabled>
+          <i data-lucide="wand-sparkles" aria-hidden="true"></i>
+          <span>生成 3D 样衣</span>
+        </button>
+      </section>
+
+      <div class="loading-screen" id="loadingScreen" role="status" aria-live="polite">
+        <div class="loading-mark">
+          <img src="./assets/loading-logo.jpg" alt="绿茵造物" />
+        </div>
+        <div class="loading-copy">
+          <strong id="loadingTitle">正在构建 3D 样衣</strong>
+          <span id="loadingProgress">初始化场景</span>
+        </div>
+        <div class="loading-track"><span id="loadingBar"></span></div>
+      </div>
+
+      <div class="toast" id="toast" role="status" aria-live="polite">
+        <i data-lucide="circle-check" aria-hidden="true"></i>
+        <span id="toastText">方案已保存</span>
+      </div>
+    </main>
+  </body>
+</html>
