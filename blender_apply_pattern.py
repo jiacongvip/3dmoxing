@@ -63,6 +63,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pattern-mask", action="append", default=[], help="2D 蒙版")
     parser.add_argument("--pattern-materials-only", action="append", default=[], help="1=透明底纯素材，不再扣衣")
     parser.add_argument("--pattern-frame", action="append", default=[], help="标定框 x,y,w,h，相对模型包围盒，y 从顶部往下")
+    parser.add_argument("--optimize-base", action="store_true", help="将白胚 GLB 压缩为轻量预览版（缩放贴图 + Draco 压缩）")
+    parser.add_argument("--max-texture-size", type=int, default=1536, help="轻量白胚最大贴图边长")
+    parser.add_argument("--decals-only", action="store_true", help="仅导出贴片网格 GLB，不重复导出原白胚")
+    parser.add_argument("--draco", action="store_true", help="导出时启用 Draco 网格压缩")
     return parser.parse_args(script_arguments())
 
 
@@ -115,13 +119,14 @@ def stand_model_up(obj: bpy.types.Object) -> str:
     return "z_to_y"
 
 
-def restore_export_up_axis(axis: str) -> None:
+def restore_export_up_axis(axis: str, only_objects: list[bpy.types.Object] | None = None) -> None:
     """导出前转回导入时的姿态。否则 glTF 会再转一次，预览里衣服就横躺着。"""
     if axis != "z_to_y":
         return
     rotation = Matrix.Rotation(math.radians(90.0), 4, "X")
     seen = set()
-    for obj in list(bpy.context.scene.objects):
+    targets = only_objects if only_objects is not None else list(bpy.context.scene.objects)
+    for obj in targets:
         if obj.type != "MESH":
             continue
         mesh = obj.data
@@ -1514,6 +1519,7 @@ def create_projected_decal(
     clip_y_max_override: float | None = None,
     garment_regions: dict | None = None,
     placement_frame: dict | None = None,
+    bvh: BVHTree | None = None,
 ) -> bpy.types.Object:
     minimum, maximum = local_bounds(target)
     size = maximum - minimum
@@ -1521,8 +1527,9 @@ def create_projected_decal(
     is_pants = placement in {"pants", "pants_back"}
     is_front_facing = placement in {"front", "pants"}
 
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    bvh = BVHTree.FromObject(target, depsgraph)
+    if bvh is None:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        bvh = BVHTree.FromObject(target, depsgraph)
     if bvh is None:
         raise RuntimeError("Unable to build garment surface index")
 
@@ -1733,16 +1740,93 @@ def patch_glb_garment_color(path: Path, material_names: list[str], color: str) -
     path.write_bytes(output)
 
 
-def export_model(path: Path, material_names: list[str], color: str) -> None:
+def optimize_base_model(input_path: Path, output_path: Path, max_texture_size: int = 1536) -> None:
+    """将原始大白胚压缩为适合手机端秒开的轻量 GLB（限制贴图尺寸 + JPEG + Draco 网格压缩）。"""
+    reset_scene()
+    import_model(input_path)
+    max_dim = max(512, min(4096, int(max_texture_size)))
+    scaled_count = 0
+    for image in bpy.data.images:
+        width, height = int(image.size[0]), int(image.size[1])
+        if width <= 0 or height <= 0:
+            continue
+        longest = max(width, height)
+        if longest > max_dim:
+            ratio = max_dim / float(longest)
+            new_w = max(1, int(round(width * ratio)))
+            new_h = max(1, int(round(height * ratio)))
+            image.scale(new_w, new_h)
+            scaled_count += 1
+            print("BASE_IMG_SCALED", image.name, f"{width}x{height}->{new_w}x{new_h}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result = bpy.ops.export_scene.gltf(
+        filepath=str(output_path.resolve()),
+        export_format="GLB",
+        export_yup=True,
+        export_apply=False,
+        export_materials="EXPORT",
+        export_image_format="JPEG",
+        export_image_quality=82,
+        export_draco_mesh_compression_enable=True,
+        export_draco_mesh_compression_level=6,
+        export_draco_position_quantization=11,
+        export_draco_normal_quantization=8,
+        export_draco_texcoord_quantization=10,
+    )
+    if "FINISHED" not in result:
+        raise RuntimeError("Base GLB optimization failed")
+    print("OPTIMIZE_BASE_DONE", {"scaled_images": scaled_count, "output": str(output_path.resolve())})
+
+
+def export_decals_only(path: Path, decal_objects: list[bpy.types.Object]) -> None:
+    """仅导出贴片网格，不重复导出上百万面的原白胚，速度提升几十倍且产物仅几百 KB。"""
+    if not decal_objects:
+        raise RuntimeError("No decals generated")
     path.parent.mkdir(parents=True, exist_ok=True)
+    for obj in list(bpy.context.scene.objects):
+        obj.select_set(False)
+    for decal in decal_objects:
+        decal.select_set(True)
+    bpy.context.view_layer.objects.active = decal_objects[0]
     result = bpy.ops.export_scene.gltf(
         filepath=str(path.resolve()),
         export_format="GLB",
         export_yup=True,
         export_apply=False,
+        use_selection=True,
         export_materials="EXPORT",
         export_image_format="AUTO",
+        export_draco_mesh_compression_enable=True,
+        export_draco_mesh_compression_level=6,
+        export_draco_position_quantization=12,
+        export_draco_normal_quantization=8,
+        export_draco_texcoord_quantization=12,
     )
+    if "FINISHED" not in result:
+        raise RuntimeError("Decals GLB export failed")
+
+
+def export_model(path: Path, material_names: list[str], color: str, *, use_draco: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    kwargs = {
+        "filepath": str(path.resolve()),
+        "export_format": "GLB",
+        "export_yup": True,
+        "export_apply": False,
+        "export_materials": "EXPORT",
+        "export_image_format": "AUTO",
+    }
+    if use_draco:
+        kwargs.update(
+            {
+                "export_draco_mesh_compression_enable": True,
+                "export_draco_mesh_compression_level": 6,
+                "export_draco_position_quantization": 11,
+                "export_draco_normal_quantization": 8,
+                "export_draco_texcoord_quantization": 10,
+            }
+        )
+    result = bpy.ops.export_scene.gltf(**kwargs)
     if "FINISHED" not in result:
         raise RuntimeError("GLB export failed")
     patch_glb_garment_color(path, material_names, color)
@@ -1753,12 +1837,19 @@ def main() -> None:
     if not args.input.is_file():
         raise FileNotFoundError(args.input)
 
+    if args.optimize_base:
+        optimize_base_model(args.input, args.output, max_texture_size=args.max_texture_size)
+        return
+
     reset_scene()
     target = import_model(args.input)
     up_axis = stand_model_up(target)
-    remove_merged_scan_side_fills()
-    material_name = ensure_side_fill_material(target)
-    if args.skip_scan_cleanup:
+    if not args.decals_only:
+        remove_merged_scan_side_fills()
+        material_name = ensure_side_fill_material(target)
+    else:
+        material_name = ""
+    if args.skip_scan_cleanup or args.decals_only:
         # 客户自己上传的白胚：不做演示扫描件专用的修复。那一步会把整张 4K/8K 贴图
         # 读成 Python 列表（几 GB 内存），在小内存服务器上直接被 OOM 杀掉。
         print("SCAN_CLEANUP_SKIPPED")
@@ -1866,6 +1957,7 @@ def main() -> None:
         else {}
     )
     print("GARMENT_REGIONS", format_garment_regions(garment_regions))
+    decal_objects: list[bpy.types.Object] = []
     for (
         pattern_path,
         placement,
@@ -1888,7 +1980,7 @@ def main() -> None:
                 garment_mask_path=optional_file(garment_mask),
                 materials_only=str(materials_only) == "1",
             )
-            create_projected_decal(
+            decal = create_projected_decal(
                 target,
                 material,
                 image,
@@ -1903,7 +1995,9 @@ def main() -> None:
                 fit_to_garment=args.fit_garment,
                 garment_regions=garment_regions,
                 placement_frame=parse_placement_frame(frame_text),
+                bvh=region_bvh,
             )
+            decal_objects.append(decal)
         except PatternSkip as error:
             print("PATTERN_SKIPPED", {"placement": placement, "error": str(error)})
             continue
@@ -1913,8 +2007,12 @@ def main() -> None:
                 print("PATTERN_SKIPPED", {"placement": placement, "error": str(error)})
                 continue
             raise
-    restore_export_up_axis(up_axis)
-    export_model(args.output, material_names, args.garment_color)
+    if args.decals_only:
+        restore_export_up_axis(up_axis, only_objects=decal_objects)
+        export_decals_only(args.output, decal_objects)
+    else:
+        restore_export_up_axis(up_axis)
+        export_model(args.output, material_names, args.garment_color, use_draco=args.draco)
     print("OUTPUT_GLB", args.output.resolve())
 
 

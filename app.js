@@ -1,6 +1,16 @@
 import * as THREE from './vendor/three.module.min.js';
 import { OrbitControls } from './vendor/OrbitControls.js';
 import { GLTFLoader } from './vendor/GLTFLoader.js';
+import { DRACOLoader } from './vendor/DRACOLoader.js';
+
+const sharedDracoLoader = new DRACOLoader();
+sharedDracoLoader.setDecoderPath('./vendor/draco/');
+
+function createGltfLoader() {
+  const loader = new GLTFLoader();
+  loader.setDRACOLoader(sharedDracoLoader);
+  return loader;
+}
 
 if (window.location.protocol === 'file:') {
   window.location.replace('http://127.0.0.1:8765/');
@@ -154,10 +164,16 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(sceneHost.clientWidth, sceneHost.clientHeight, false);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.autoUpdate = false;
+renderer.shadowMap.needsUpdate = true;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.04;
 sceneHost.appendChild(renderer.domElement);
+
+function refreshShadows() {
+  renderer.shadowMap.needsUpdate = true;
+}
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
@@ -176,7 +192,8 @@ scene.add(hemiLight);
 const keyLight = new THREE.DirectionalLight('#fff8ed', 3.6);
 keyLight.position.set(4.2, 6.5, 5.2);
 keyLight.castShadow = true;
-keyLight.shadow.mapSize.set(2048, 2048);
+const shadowMapSize = window.innerWidth <= 760 ? 1024 : 2048;
+keyLight.shadow.mapSize.set(shadowMapSize, shadowMapSize);
 keyLight.shadow.camera.left = -4;
 keyLight.shadow.camera.right = 4;
 keyLight.shadow.camera.top = 6;
@@ -692,25 +709,60 @@ function wait(milliseconds) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
-async function pollGenerationTask(taskId) {
-  for (let attempt = 0; attempt < 180; attempt += 1) {
+async function pollGenerationTask(taskId, options = {}) {
+  const { silent = false } = options;
+  for (let attempt = 0; attempt < 300; attempt += 1) {
     const response = await fetch(`/api/tasks/${taskId}`, { cache: 'no-store', headers: apiHeaders() });
     const payload = await response.json();
     if (!response.ok || payload.code !== 200) throw new Error(payload.msg || '生成任务查询失败');
     const task = payload.data;
-    setLoading(true, 'Blender 正在生成 3D 样衣', task.message || '处理服装曲面', task.progress || 12);
+    if (silent) {
+      modelStatus.innerHTML = `<span class="status-dot" aria-hidden="true"></span>${task.message || '正在贴合图案...'}`;
+    } else {
+      setLoading(true, 'Blender 正在生成 3D 样衣', task.message || '处理服装曲面', task.progress || 12);
+    }
     if (task.status === 'completed') return task;
     if (task.status === 'failed') throw new Error(task.error || 'Blender 生成失败');
-    await wait(1000);
+    await wait(attempt < 25 ? 300 : 600);
   }
   throw new Error('Blender 生成超时');
 }
 
+function loadGltfUrl(url, onProgress) {
+  return new Promise((resolve, reject) => {
+    const loader = createGltfLoader();
+    loader.load(
+      url,
+      (gltf) => resolve(gltf),
+      onProgress,
+      () => reject(new Error('GLB 载入失败')),
+    );
+  });
+}
+
+function prepareDecalMaterials(root) {
+  root.traverse((node) => {
+    if (!node.isMesh) return;
+    node.castShadow = false;
+    node.receiveShadow = false;
+    node.renderOrder = 2;
+    const nodeMaterials = Array.isArray(node.material) ? node.material : [node.material];
+    nodeMaterials.forEach((material) => {
+      if (!material?.isMaterial) return;
+      if (material.map) material.map.colorSpace = THREE.SRGBColorSpace;
+      material.depthWrite = false;
+      material.polygonOffset = true;
+      material.polygonOffsetFactor = -2;
+      material.polygonOffsetUnits = -2;
+    });
+  });
+}
+
 function loadGeneratedModel(url, placements) {
   return new Promise((resolve, reject) => {
-    const loader = new GLTFLoader();
+    const loader = createGltfLoader();
     loader.load(
-      `${url}?v=${Date.now()}`,
+      url,
       (gltf) => {
         try {
           const displayName = placements.length > 1
@@ -794,30 +846,56 @@ async function generateBlenderModel() {
   }
 }
 
-function loadPreviewBaseModel(config) {
-  return new Promise((resolve, reject) => {
-    const loader = new GLTFLoader();
-    loader.load(
-      `/api/model?url=${encodeURIComponent(config.model)}`,
-      (gltf) => {
-        try {
-          replaceWithImportedModel(gltf.scene, config.model, config.title || '定制样衣', {
-            statusText: '白胚模型',
-            toastMessage: '已载入白胚，暂无可贴合的效果图',
-          });
-          resolve();
-        } catch (error) {
-          reject(error);
-        }
-      },
-      (event) => {
-        if (!event.total) return;
-        const percent = Math.round((event.loaded / event.total) * 100);
-        setLoading(true, '正在载入白胚', `已完成 ${percent}%`, percent);
-      },
-      () => reject(new Error('白胚 GLB 载入失败')),
-    );
+function loadPreviewBaseModel(config, options = {}) {
+  const {
+    statusText = '白胚模型',
+    toastMessage = '已载入白胚，暂无可贴合的效果图',
+    hideLoadingOnReady = true,
+  } = options;
+  return loadGltfUrl(
+    `/api/model?url=${encodeURIComponent(config.model)}`,
+    (event) => {
+      if (!event.total) return;
+      const percent = Math.round((event.loaded / event.total) * 100);
+      setLoading(true, '正在载入 3D 模型', `已完成 ${percent}%`, Math.max(10, Math.min(95, percent)));
+    },
+  ).then((gltf) => {
+    const wrapper = new THREE.Group();
+    wrapper.name = 'PreviewGarmentWrapper';
+    wrapper.add(gltf.scene);
+    replaceWithImportedModel(wrapper, config.model, config.title || '定制样衣', {
+      statusText,
+      toastMessage,
+      keepLoading: !hideLoadingOnReady,
+    });
+    return wrapper;
   });
+}
+
+async function generatePreviewDecals(config, isBaseReady) {
+  const response = await fetch('/api/generate', {
+    method: 'POST',
+    headers: apiHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({
+      base_model_url: config.model,
+      color: config.color || DEFAULT_PREVIEW_COLOR,
+      patterns: config.patterns,
+      // 纯素材图靠透明通道；有白胚底图时仍做衣身对齐，避免把小 Logo 拉满全身
+      fit_garment: true,
+      decals_only: true,
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok || payload.code !== 202) throw new Error(payload.msg || '贴合任务创建失败');
+  let decalsUrl = payload.data?.cached ? (payload.data.decals_url || payload.data.model_url || '') : '';
+  if (!decalsUrl) {
+    const task = await pollGenerationTask(payload.data.task_id, { silent: isBaseReady() });
+    decalsUrl = task.decals_url || task.model_url;
+  }
+  if (!decalsUrl) throw new Error('未返回 3D 贴图地址');
+  const gltf = await loadGltfUrl(decalsUrl);
+  prepareDecalMaterials(gltf.scene);
+  return { scene: gltf.scene, url: decalsUrl };
 }
 
 async function runPreviewMode(config) {
@@ -839,33 +917,66 @@ async function runPreviewMode(config) {
   }
 
   state.isGenerating = true;
-  setLoading(true, '正在生成 3D 效果', '提交贴合任务', 8);
-  try {
-    const response = await fetch('/api/generate', {
-      method: 'POST',
-      headers: apiHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        base_model_url: config.model,
-        color: config.color || DEFAULT_PREVIEW_COLOR,
-        patterns: config.patterns,
-        // 纯素材图靠透明通道；有白胚底图时仍做衣身对齐，避免把小 Logo 拉满全身
-        fit_garment: true,
-      }),
-    });
-    const payload = await response.json();
-    if (!response.ok || payload.code !== 202) throw new Error(payload.msg || '贴合任务创建失败');
-    const task = await pollGenerationTask(payload.data.task_id);
-    await loadGeneratedModel(task.model_url, config.patterns.map((pattern) => pattern.placement));
+  setLoading(true, '正在载入 3D 效果', '并行加载模型与图案', 10);
+
+  let baseWrapper = null;
+  let pendingDecals = null;
+  let decalsFinished = false;
+
+  const attachDecals = (decals) => {
+    if (!baseWrapper || !decals) return;
+    baseWrapper.add(decals.scene);
+    state.generatedModelUrl = decals.url;
+    refreshShadows();
     modelStatus.innerHTML = '<span class="status-dot" aria-hidden="true"></span>3D 效果';
-  } catch (error) {
-    showToast(error.message || '3D 效果生成失败，先展示白胚');
-    try {
-      await loadPreviewBaseModel(config);
-    } catch {
+    document.body.dataset.previewReady = '1';
+    setLoading(false);
+  };
+
+  // 并行：一边立刻加载缓存的轻量白胚（秒出画面），一边请求仅几百 KB 的贴片 GLB
+  const baseTask = loadPreviewBaseModel(config, {
+    statusText: '正在贴合图案...',
+    toastMessage: '',
+    hideLoadingOnReady: true,
+  })
+    .then((wrapper) => {
+      baseWrapper = wrapper;
+      if (pendingDecals) {
+        attachDecals(pendingDecals);
+        pendingDecals = null;
+      } else if (decalsFinished) {
+        modelStatus.innerHTML = '<span class="status-dot" aria-hidden="true"></span>白胚模型';
+      }
+      return wrapper;
+    })
+    .catch((error) => {
       setLoading(false);
-    }
+      showToast(error.message || '白胚载入失败');
+      return null;
+    });
+
+  const decalsTask = generatePreviewDecals(config, () => Boolean(baseWrapper))
+    .then((decals) => {
+      decalsFinished = true;
+      if (baseWrapper) {
+        attachDecals(decals);
+      } else {
+        pendingDecals = decals;
+      }
+    })
+    .catch((error) => {
+      decalsFinished = true;
+      if (baseWrapper) {
+        modelStatus.innerHTML = '<span class="status-dot" aria-hidden="true"></span>白胚模型';
+      }
+      showToast(error.message || '图案贴合失败，已展示白胚');
+    });
+
+  try {
+    await Promise.all([baseTask, decalsTask]);
   } finally {
     state.isGenerating = false;
+    setLoading(false);
   }
 }
 
@@ -978,10 +1089,18 @@ function replaceWithImportedModel(root, filename, displayName = '', options = {}
   productTitle.textContent = cleanName || '自定义服装模型';
   modelStatus.innerHTML = `<span class="status-dot" aria-hidden="true"></span>${options.statusText || '自定义模型'}`;
   resetCamera();
+  refreshShadows();
+  if (state.previewMode) {
+    if (!options.keepLoading) setLoading(false);
+    document.body.dataset.previewReady = '1';
+    if (options.toastMessage) showToast(options.toastMessage);
+    return;
+  }
   setLoading(true, '正在上色', '按原图换色，保留黑边', 92);
   ensureGarmentMask()
     .then(() => {
       updateFabric();
+      refreshShadows();
       setLoading(false);
       document.body.dataset.previewReady = '1';
       showToast(
@@ -990,6 +1109,7 @@ function replaceWithImportedModel(root, filename, displayName = '', options = {}
     })
     .catch(() => {
       updateFabric();
+      refreshShadows();
       setLoading(false);
       document.body.dataset.previewReady = '1';
     });
@@ -997,7 +1117,7 @@ function replaceWithImportedModel(root, filename, displayName = '', options = {}
 
 function loadDefaultModel() {
   setLoading(true, '正在载入定制样衣', '读取模型数据', 8);
-  const loader = new GLTFLoader();
+  const loader = createGltfLoader();
   loader.load(
     DEFAULT_MODEL_URL,
     (gltf) => {
@@ -1034,7 +1154,7 @@ function loadLocalModel(file) {
   state.generatedModelUrl = '';
   setLoading(true, '正在载入 3D 模型', '读取模型数据', 12);
   const objectUrl = URL.createObjectURL(file);
-  const loader = new GLTFLoader();
+  const loader = createGltfLoader();
   loader.load(
     objectUrl,
     (gltf) => {

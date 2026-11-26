@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,6 +44,13 @@ BPY_PYTHON = blender_python()
 OUTPUT_ROOT = ROOT / "output" / "jobs"
 CACHE_ROOT = ROOT / "output" / "cache"
 RESULT_CACHE_ROOT = ROOT / "output" / "cache" / "results"
+IMAGE_CACHE_ROOT = ROOT / "output" / "cache" / "images"
+LITE_MODEL_FILENAME = "model-lite-v1.glb"
+LITE_MIN_RAW_BYTES = 4 * 1024 * 1024
+LITE_MAX_TEXTURE_SIZE = int(os.environ.get("CUSTOMDIY_LITE_MAX_TEXTURE", "1536"))
+JOB_TTL_SECONDS = int(os.environ.get("CUSTOMDIY_JOB_TTL_SECONDS", str(24 * 3600)))
+IMAGE_CACHE_TTL_SECONDS = int(os.environ.get("CUSTOMDIY_IMAGE_CACHE_TTL_SECONDS", str(7 * 24 * 3600)))
+TASK_TTL_SECONDS = 2 * 3600
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_MODEL_BYTES = 80 * 1024 * 1024
 MAX_REQUEST_BYTES = MAX_IMAGE_BYTES * 6
@@ -62,11 +70,37 @@ PLACEMENT_NAMES = {
 TASKS: dict[str, dict] = {}
 TASK_LOCK = threading.Lock()
 BLENDER_LOCK = threading.Lock()
+MODEL_LOCKS: dict[str, threading.Lock] = {}
+MODEL_LOCKS_GUARD = threading.Lock()
+
+
+def get_model_lock(digest: str) -> threading.Lock:
+    with MODEL_LOCKS_GUARD:
+        lock = MODEL_LOCKS.get(digest)
+        if lock is None:
+            lock = threading.Lock()
+            MODEL_LOCKS[digest] = lock
+        return lock
+
+
+def atomic_write_bytes(target: Path, data: bytes) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_bytes(data)
+        tmp.replace(target)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def task_update(task_id: str, **values) -> None:
     with TASK_LOCK:
-        TASKS[task_id].update(values)
+        if task_id in TASKS:
+            TASKS[task_id].update(values)
 
 
 def bounded_number(value: object, minimum: float, maximum: float, label: str) -> float:
@@ -103,6 +137,18 @@ def download_bytes(url: str, max_bytes: int, label: str) -> bytes:
     return data
 
 
+def blender_command(args: list[str]) -> list[str]:
+    command = [str(BPY_PYTHON), *args]
+    # bpy 作为 Python 模块可以完全无头运行，默认不套 xvfb-run。
+    # 只有显式设置 CUSTOMDIY_USE_XVFB=1 且没有 DISPLAY 时才包一层（需要镜像里有 xauth）。
+    if os.environ.get("DISPLAY") or os.environ.get("CUSTOMDIY_USE_XVFB", "").strip() != "1":
+        return command
+    xvfb = shutil.which("xvfb-run")
+    if xvfb:
+        return [xvfb, "-a", "-s", "-screen 0 1024x768x24", *command]
+    return command
+
+
 def cached_model_path(url: str) -> Path:
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
     folder = CACHE_ROOT / digest
@@ -110,11 +156,83 @@ def cached_model_path(url: str) -> Path:
     target = folder / "model.glb"
     if target.is_file() and target.stat().st_size > 64:
         return target
-    target.write_bytes(download_bytes(url, MAX_MODEL_BYTES, "底模"))
+    lock = get_model_lock(digest)
+    with lock:
+        if target.is_file() and target.stat().st_size > 64:
+            return target
+        atomic_write_bytes(target, download_bytes(url, MAX_MODEL_BYTES, "底模"))
     return target
 
 
-def result_cache_key(base_model_url: str, color: str, patterns: list[dict], fit_garment: bool = False) -> str:
+def cached_lite_model_path(url: str) -> tuple[Path, str]:
+    """返回轻量压缩版白胚（1536px JPEG + Draco）；若原模型已足够小或压缩失败则回退原文件。"""
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    raw_path = cached_model_path(url)
+    raw_size = raw_path.stat().st_size
+    if raw_size <= LITE_MIN_RAW_BYTES:
+        return raw_path, f"/output/cache/{digest}/model.glb"
+
+    lite_path = raw_path.parent / LITE_MODEL_FILENAME
+    if lite_path.is_file() and lite_path.stat().st_size > 64:
+        return lite_path, f"/output/cache/{digest}/{LITE_MODEL_FILENAME}"
+
+    lock = get_model_lock(digest)
+    with lock:
+        if lite_path.is_file() and lite_path.stat().st_size > 64:
+            return lite_path, f"/output/cache/{digest}/{LITE_MODEL_FILENAME}"
+        tmp_path = raw_path.parent / f".{LITE_MODEL_FILENAME}.{uuid.uuid4().hex}.tmp.glb"
+        try:
+            with BLENDER_LOCK:
+                command = blender_command(
+                    [
+                        str(BLENDER_SCRIPT),
+                        "--input",
+                        str(raw_path),
+                        "--output",
+                        str(tmp_path),
+                        "--optimize-base",
+                        "--max-texture-size",
+                        str(LITE_MAX_TEXTURE_SIZE),
+                    ]
+                )
+                result = subprocess.run(
+                    command,
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    check=False,
+                )
+            if result.returncode == 0 and tmp_path.is_file():
+                lite_size = tmp_path.stat().st_size
+                if 64 < lite_size < raw_size:
+                    tmp_path.replace(lite_path)
+                    print(
+                        f"[lite-base] {digest[:12]} {raw_size / 1048576:.2f}MB -> {lite_size / 1048576:.2f}MB",
+                        flush=True,
+                    )
+                    return lite_path, f"/output/cache/{digest}/{LITE_MODEL_FILENAME}"
+            else:
+                detail = (result.stderr or result.stdout or "")[-400:].strip()
+                print(f"[lite-base] optimize failed ({digest[:12]}): {detail}", flush=True)
+        except Exception as error:  # noqa: BLE001
+            print(f"[lite-base] optimize error ({digest[:12]}): {error}", flush=True)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+    return raw_path, f"/output/cache/{digest}/model.glb"
+
+
+def result_cache_key(
+    base_model_url: str,
+    color: str,
+    patterns: list[dict],
+    fit_garment: bool = False,
+    decals_only: bool = False,
+) -> str:
     """Only URL-based inputs are cacheable; base64 uploads always regenerate."""
     if not base_model_url:
         return ""
@@ -144,8 +262,9 @@ def result_cache_key(base_model_url: str, color: str, patterns: list[dict], fit_
             "color": color,
             "patterns": normalized,
             "fit": bool(fit_garment),
+            "decals_only": bool(decals_only),
             "algo": FIT_ALGO_VERSION,
-            "v": 11,
+            "v": 12,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -153,33 +272,62 @@ def result_cache_key(base_model_url: str, color: str, patterns: list[dict], fit_
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def cached_result_path(cache_key: str) -> Path | None:
+def cached_result_path(cache_key: str, *, decals_only: bool = False) -> Path | None:
     if not cache_key:
         return None
-    target = RESULT_CACHE_ROOT / cache_key / "model.glb"
+    filename = "decals.glb" if decals_only else "model.glb"
+    target = RESULT_CACHE_ROOT / cache_key / filename
     if target.is_file() and target.stat().st_size > 64:
         return target
     return None
 
 
-def store_result_cache(cache_key: str, output_path: Path) -> None:
+def store_result_cache(cache_key: str, output_path: Path, *, decals_only: bool = False) -> Path | None:
     if not cache_key or not output_path.is_file():
-        return
+        return None
+    filename = "decals.glb" if decals_only else "model.glb"
     folder = RESULT_CACHE_ROOT / cache_key
     folder.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(output_path, folder / "model.glb")
+    target = folder / filename
+    tmp = folder / f".{filename}.{uuid.uuid4().hex}.tmp"
+    try:
+        shutil.copyfile(output_path, tmp)
+        tmp.replace(target)
+        return target
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def cached_image_bytes(url: str, max_bytes: int, label: str) -> tuple[bytes, str]:
+    suffix = Path(urlparse(url).path).suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+        suffix = ".png"
+    if suffix == ".jpeg":
+        suffix = ".jpg"
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    cached = IMAGE_CACHE_ROOT / f"{digest}{suffix}"
+    if cached.is_file() and cached.stat().st_size > 16:
+        try:
+            os.utime(cached, None)
+        except OSError:
+            pass
+        return cached.read_bytes(), suffix
+    raw_image = download_bytes(url, max_bytes, label)
+    try:
+        atomic_write_bytes(cached, raw_image)
+    except OSError:
+        pass
+    return raw_image, suffix
 
 
 def decode_pattern_image(pattern_payload: dict) -> tuple[bytes, str]:
     image_url = str(pattern_payload.get("image_url") or "").strip()
     if image_url:
-        raw_image = download_bytes(image_url, MAX_IMAGE_BYTES, "图案")
-        suffix = Path(urlparse(image_url).path).suffix.lower()
-        if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
-            suffix = ".png"
-        if suffix == ".jpeg":
-            suffix = ".jpg"
-        return raw_image, suffix
+        return cached_image_bytes(image_url, MAX_IMAGE_BYTES, "图案")
     image_data = pattern_payload.get("image_data", "")
     match = re.fullmatch(r"data:(image/(?:png|jpeg|webp));base64,(.+)", str(image_data), re.DOTALL)
     if not match:
@@ -199,7 +347,7 @@ def optional_pattern_image(url: object) -> tuple[bytes, str] | None:
     if str(urlparse(image_url).path or "").strip("/") == "":
         return None
     try:
-        raw_image, suffix = decode_pattern_image({"image_url": image_url})
+        raw_image, suffix = cached_image_bytes(image_url, MAX_IMAGE_BYTES, "参考图")
     except ValueError:
         return None
     # 校验真实图片文件头，网页/JSON 一律丢掉，不让 Blender 读到坏文件
@@ -212,25 +360,53 @@ def optional_pattern_image(url: object) -> tuple[bytes, str] | None:
     return raw_image, suffix
 
 
-def resolve_input_model(payload: dict) -> Path:
+def resolve_input_model(payload: dict) -> tuple[Path, str]:
     url = str(payload.get("base_model_url") or payload.get("model_url") or "").strip()
     if url:
-        return cached_model_path(url)
+        return cached_lite_model_path(url)
     if MODEL_PATH.is_file():
-        return MODEL_PATH
+        return MODEL_PATH, "/assets/custom-garment.glb"
     raise ValueError("缺少白胚 GLB")
 
 
-def blender_command(args: list[str]) -> list[str]:
-    command = [str(BPY_PYTHON), *args]
-    # bpy 作为 Python 模块可以完全无头运行，默认不套 xvfb-run。
-    # 只有显式设置 CUSTOMDIY_USE_XVFB=1 且没有 DISPLAY 时才包一层（需要镜像里有 xauth）。
-    if os.environ.get("DISPLAY") or os.environ.get("CUSTOMDIY_USE_XVFB", "").strip() != "1":
-        return command
-    xvfb = shutil.which("xvfb-run")
-    if xvfb:
-        return [xvfb, "-a", "-s", "-screen 0 1024x768x24", *command]
-    return command
+def decode_one_pattern(pattern_payload: dict) -> dict:
+    placement = pattern_payload.get("placement")
+    if placement not in PLACEMENT_NAMES:
+        raise ValueError("图案位置必须是唯一的正面、背部、左袖、右袖、下装或下装背面")
+    scale = bounded_number(pattern_payload.get("scale", 1.0), 0.55, 1.8, "图案大小")
+    default_position_x = 0.4 if placement == "front" else 0.0
+    default_position_y = 0.2 if placement == "front" else (0.15 if placement == "back" else 0.0)
+    raw_position_x = pattern_payload.get("position_x")
+    raw_position_y = pattern_payload.get("position_y")
+    position_x = bounded_number(
+        default_position_x if raw_position_x is None else raw_position_x,
+        -1.0,
+        1.0,
+        "左右位置",
+    )
+    position_y = bounded_number(
+        default_position_y if raw_position_y is None else raw_position_y,
+        -1.0,
+        1.0,
+        "上下位置",
+    )
+    raw_image, extension = decode_pattern_image(pattern_payload)
+    base_image = optional_pattern_image(pattern_payload.get("base_image_url"))
+    overlay_image = optional_pattern_image(pattern_payload.get("overlay_image_url"))
+    mask_image = optional_pattern_image(pattern_payload.get("mask_image_url"))
+    return {
+        "placement": placement,
+        "raw_image": raw_image,
+        "extension": extension,
+        "scale": scale,
+        "position_x": position_x,
+        "position_y": position_y,
+        "base_image": base_image,
+        "overlay_image": overlay_image,
+        "mask_image": mask_image,
+        "materials_only": int(pattern_payload.get("materials_only") or 0),
+        "frame": str(pattern_payload.get("frame") or "").strip(),
+    }
 
 
 def generate_model(
@@ -241,13 +417,15 @@ def generate_model(
     input_path: Path,
     cache_key: str = "",
     fit_garment: bool = False,
+    decals_only: bool = False,
+    base_model_public_url: str = "",
 ) -> None:
     started = time.monotonic()
     try:
         task_update(task_id, status="processing", progress=12, message="等待 Blender 处理")
         with BLENDER_LOCK:
             placement_names = "、".join(PLACEMENT_NAMES[item["placement"]] for item in patterns)
-            task_update(task_id, progress=28, message=f"Blender 正在投射{placement_names}图案")
+            task_update(task_id, progress=32, message=f"正在投射{placement_names}图案")
             command = blender_command(
                 [
                     str(BLENDER_SCRIPT),
@@ -264,6 +442,10 @@ def generate_model(
                 command.append("--skip-scan-cleanup")
             if fit_garment:
                 command.append("--fit-garment")
+            if decals_only:
+                command.append("--decals-only")
+            else:
+                command.append("--draco")
             for item in patterns:
                 command.extend(
                     [
@@ -310,29 +492,103 @@ def generate_model(
             detail = (result.stderr or result.stdout or "Blender generation failed")[-3000:]
             raise RuntimeError(detail.strip())
 
+        filename = "decals.glb" if decals_only else "model.glb"
+        public_url = f"/output/jobs/{task_id}/{filename}"
         try:
-            store_result_cache(cache_key, output_path)
+            stored = store_result_cache(cache_key, output_path, decals_only=decals_only)
+            if stored is not None:
+                public_url = f"/output/cache/results/{cache_key}/{filename}"
         except OSError:
             pass
         elapsed = round(time.monotonic() - started, 2)
+        update_payload = {
+            "status": "completed",
+            "progress": 100,
+            "message": "3D 贴图已生成" if decals_only else "定制 GLB 已生成",
+            "model_url": public_url,
+            "decals_only": bool(decals_only),
+            "elapsed": elapsed,
+            "placements": [item["placement"] for item in patterns],
+            "finished_at": time.time(),
+        }
+        if decals_only:
+            update_payload["decals_url"] = public_url
+        if base_model_public_url:
+            update_payload["base_model_url"] = base_model_public_url
+        task_update(task_id, **update_payload)
+    except Exception as error:  # noqa: BLE001 - task boundary
         task_update(
             task_id,
-            status="completed",
+            status="failed",
             progress=100,
-            message="定制 GLB 已生成",
-            model_url=f"/output/jobs/{task_id}/model.glb",
-            elapsed=elapsed,
-            placements=[item["placement"] for item in patterns],
+            message="生成失败",
+            error=str(error),
+            finished_at=time.time(),
         )
-    except Exception as error:  # noqa: BLE001 - task boundary
-        task_update(task_id, status="failed", progress=100, message="生成失败", error=str(error))
+
+
+def cleanup_old_artifacts() -> None:
+    now = time.time()
+    if OUTPUT_ROOT.is_dir():
+        for entry in list(OUTPUT_ROOT.iterdir()):
+            if not entry.is_dir():
+                continue
+            try:
+                if now - entry.stat().st_mtime > JOB_TTL_SECONDS:
+                    shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                pass
+    if IMAGE_CACHE_ROOT.is_dir():
+        for entry in list(IMAGE_CACHE_ROOT.iterdir()):
+            if not entry.is_file():
+                continue
+            try:
+                if now - entry.stat().st_mtime > IMAGE_CACHE_TTL_SECONDS:
+                    entry.unlink(missing_ok=True)
+            except OSError:
+                pass
+    with TASK_LOCK:
+        stale = [
+            tid
+            for tid, task in TASKS.items()
+            if task.get("finished_at") and now - float(task["finished_at"]) > TASK_TTL_SECONDS
+        ]
+        for tid in stale:
+            TASKS.pop(tid, None)
+
+
+def cleanup_loop() -> None:
+    while True:
+        try:
+            cleanup_old_artifacts()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(3600)
 
 
 class DemoHandler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    extensions_map = {
+        **SimpleHTTPRequestHandler.extensions_map,
+        ".glb": "model/gltf-binary",
+        ".gltf": "model/gltf+json",
+        ".wasm": "application/wasm",
+        ".js": "application/javascript; charset=utf-8",
+        ".mjs": "application/javascript; charset=utf-8",
+    }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
+
+    def end_headers(self) -> None:
+        path = urlparse(self.path).path
+        if path.startswith("/output/cache/") or path.startswith("/vendor/"):
+            self.send_header("Cache-Control", "public, max-age=2592000, immutable")
+            self.send_header("Access-Control-Allow-Origin", "*")
+        elif path.startswith("/output/jobs/"):
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("Access-Control-Allow-Origin", "*")
+        super().end_headers()
 
     def send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -343,7 +599,7 @@ class DemoHandler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Internal-Token")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.end_headers()
+        super().end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self) -> None:  # noqa: N802 - stdlib handler API
@@ -352,7 +608,7 @@ class DemoHandler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Internal-Token")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Content-Length", "0")
-        self.end_headers()
+        super().end_headers()
 
     def authorized(self) -> bool:
         if not INTERNAL_TOKEN:
@@ -369,29 +625,33 @@ class DemoHandler(SimpleHTTPRequestHandler):
                     "data": {
                         "generator_ready": BPY_PYTHON.is_file(),
                         "model_ready": MODEL_PATH.is_file(),
+                        "decals_only_supported": True,
                     },
                 }
             )
             return
 
         if path == "/api/model":
-            # 预览模式没有图案时，直接把外部白胚代理成同源文件，避免浏览器跨域拿不到 GLB。
+            # 重定向到 /output/cache/... 的轻量压缩白胚，交由 Nginx 直接静态托管 + immutable 缓存。
             query = parse_qs(urlparse(self.path).query)
             url = str((query.get("url") or [""])[0]).strip()
+            want_raw = str((query.get("raw") or [""])[0]).strip() == "1"
             try:
-                model_path = cached_model_path(url)
+                if want_raw:
+                    raw_path = cached_model_path(url)
+                    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+                    public_url = f"/output/cache/{digest}/{raw_path.name}"
+                else:
+                    _model_path, public_url = cached_lite_model_path(url)
             except ValueError as error:
                 self.send_json({"code": 400, "msg": str(error), "data": {}}, HTTPStatus.BAD_REQUEST)
                 return
-            size = model_path.stat().st_size
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "model/gltf-binary")
-            self.send_header("Content-Length", str(size))
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", public_url)
             self.send_header("Cache-Control", "public, max-age=86400")
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            with model_path.open("rb") as handle:
-                shutil.copyfileobj(handle, self.wfile)
+            self.send_header("Content-Length", "0")
+            super().end_headers()
             return
 
         match = re.fullmatch(r"/api/tasks/([a-f0-9]{32})", path)
@@ -439,78 +699,67 @@ class DemoHandler(SimpleHTTPRequestHandler):
             if not 1 <= len(pattern_payloads) <= 6:
                 raise ValueError("每次最多生成正面、背部、左右袖、下装和下装背面六个图案")
 
+            seen_placements: set[str] = set()
+            for item in pattern_payloads:
+                placement = item.get("placement")
+                if placement not in PLACEMENT_NAMES or placement in seen_placements:
+                    raise ValueError("图案位置必须是唯一的正面、背部、左袖、右袖、下装或下装背面")
+                seen_placements.add(placement)
+
             base_model_url = str(payload.get("base_model_url") or payload.get("model_url") or "").strip()
             # DIY 整片效果图模式：抠掉背景并把效果图轮廓对齐到衣身；默认的编辑器模式仍是"盖章"小 Logo。
             fit_garment = bool(payload.get("fit_garment"))
-            cache_key = result_cache_key(base_model_url, color, pattern_payloads, fit_garment)
-            cached_result = cached_result_path(cache_key)
+            # 预览模式只导出几百 KB 的贴片 GLB，由前端和已缓存的轻量白胚并行叠加，彻底避免重复导出大白胚。
+            decals_only = bool(payload.get("decals_only")) and bool(base_model_url)
+            cache_key = result_cache_key(base_model_url, color, pattern_payloads, fit_garment, decals_only)
+            cached_result = cached_result_path(cache_key, decals_only=decals_only)
             if cached_result is not None:
-                # 同一底模 + 同一颜色 + 同一组效果图，直接返回上次结果，不再跑 Blender。
+                filename = "decals.glb" if decals_only else "model.glb"
+                cached_url = f"/output/cache/results/{cache_key}/{filename}"
                 task_id = uuid.uuid4().hex
+                task_record = {
+                    "task_id": task_id,
+                    "status": "completed",
+                    "progress": 100,
+                    "message": "3D 贴图已生成（缓存）" if decals_only else "定制 GLB 已生成（缓存）",
+                    "model_url": cached_url,
+                    "decals_only": bool(decals_only),
+                    "cached": True,
+                    "placements": [str(item.get("placement") or "") for item in pattern_payloads],
+                    "finished_at": time.time(),
+                }
+                if decals_only:
+                    task_record["decals_url"] = cached_url
                 with TASK_LOCK:
-                    TASKS[task_id] = {
-                        "task_id": task_id,
-                        "status": "completed",
-                        "progress": 100,
-                        "message": "定制 GLB 已生成（缓存）",
-                        "model_url": f"/output/cache/results/{cache_key}/model.glb",
-                        "cached": True,
-                        "placements": [str(item.get("placement") or "") for item in pattern_payloads],
-                    }
+                    TASKS[task_id] = task_record
                 self.send_json(
-                    {"code": 202, "msg": "任务已创建", "data": {"task_id": task_id, "cached": True}},
+                    {
+                        "code": 202,
+                        "msg": "任务已创建",
+                        "data": {
+                            "task_id": task_id,
+                            "cached": True,
+                            "decals_only": bool(decals_only),
+                            "model_url": cached_url,
+                            "decals_url": cached_url if decals_only else "",
+                        },
+                    },
                     HTTPStatus.ACCEPTED,
                 )
                 return
 
-            # 缓存未命中才去下载底模（可能几十 MB），命中时上面已经直接返回。
-            input_path = resolve_input_model(payload)
-
-            decoded_patterns: list[dict] = []
-            seen_placements: set[str] = set()
-            for pattern_payload in pattern_payloads:
-                placement = pattern_payload.get("placement")
-                if placement not in PLACEMENT_NAMES or placement in seen_placements:
-                    raise ValueError("图案位置必须是唯一的正面、背部、左袖、右袖、下装或下装背面")
-                seen_placements.add(placement)
-                raw_image, extension = decode_pattern_image(pattern_payload)
-                scale = bounded_number(pattern_payload.get("scale", 1.0), 0.55, 1.8, "图案大小")
-                default_position_x = 0.4 if placement == "front" else 0.0
-                default_position_y = 0.2 if placement == "front" else (0.15 if placement == "back" else 0.0)
-                raw_position_x = pattern_payload.get("position_x")
-                raw_position_y = pattern_payload.get("position_y")
-                position_x = bounded_number(
-                    default_position_x if raw_position_x is None else raw_position_x,
-                    -1.0,
-                    1.0,
-                    "左右位置",
-                )
-                position_y = bounded_number(
-                    default_position_y if raw_position_y is None else raw_position_y,
-                    -1.0,
-                    1.0,
-                    "上下位置",
-                )
-                decoded_patterns.append(
-                    {
-                        "placement": placement,
-                        "raw_image": raw_image,
-                        "extension": extension,
-                        "scale": scale,
-                        "position_x": position_x,
-                        "position_y": position_y,
-                        "base_image": optional_pattern_image(pattern_payload.get("base_image_url")),
-                        "overlay_image": optional_pattern_image(pattern_payload.get("overlay_image_url")),
-                        "mask_image": optional_pattern_image(pattern_payload.get("mask_image_url")),
-                        "materials_only": int(pattern_payload.get("materials_only") or 0),
-                        "frame": str(pattern_payload.get("frame") or "").strip(),
-                    }
-                )
+            # 并发下载底模与所有图案/底图，充分利用本地缓存与带宽。
+            with ThreadPoolExecutor(max_workers=min(6, len(pattern_payloads) + 1)) as pool:
+                model_future = pool.submit(resolve_input_model, payload)
+                pattern_futures = [pool.submit(decode_one_pattern, item) for item in pattern_payloads]
+                input_path, base_model_public_url = model_future.result()
+                decoded_patterns = [future.result() for future in pattern_futures]
 
             task_id = uuid.uuid4().hex
             task_dir = OUTPUT_ROOT / task_id
             task_dir.mkdir(parents=True, exist_ok=False)
-            output_path = task_dir / "model.glb"
+            output_filename = "decals.glb" if decals_only else "model.glb"
+            output_path = task_dir / output_filename
             patterns: list[dict] = []
             for item in decoded_patterns:
                 placement = item["placement"]
@@ -543,16 +792,36 @@ class DemoHandler(SimpleHTTPRequestHandler):
                     "status": "pending",
                     "progress": 5,
                     "message": "任务已创建",
+                    "decals_only": bool(decals_only),
+                    "base_model_url": base_model_public_url,
                     "placements": [item["placement"] for item in patterns],
                 }
             worker = threading.Thread(
                 target=generate_model,
-                args=(task_id, patterns, color, output_path, input_path, cache_key, fit_garment),
+                args=(
+                    task_id,
+                    patterns,
+                    color,
+                    output_path,
+                    input_path,
+                    cache_key,
+                    fit_garment,
+                    decals_only,
+                    base_model_public_url,
+                ),
                 daemon=True,
             )
             worker.start()
             self.send_json(
-                {"code": 202, "msg": "任务已创建", "data": {"task_id": task_id}},
+                {
+                    "code": 202,
+                    "msg": "任务已创建",
+                    "data": {
+                        "task_id": task_id,
+                        "decals_only": bool(decals_only),
+                        "base_model_url": base_model_public_url,
+                    },
+                },
                 HTTPStatus.ACCEPTED,
             )
         except (ValueError, TypeError, KeyError, json.JSONDecodeError, binascii.Error) as error:
@@ -563,6 +832,8 @@ def main() -> None:
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     RESULT_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    IMAGE_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=cleanup_loop, daemon=True).start()
     server = ThreadingHTTPServer((BIND_HOST, BIND_PORT), DemoHandler)
     print(f"Clothing Blender demo: http://{BIND_HOST}:{BIND_PORT}/", flush=True)
     server.serve_forever()

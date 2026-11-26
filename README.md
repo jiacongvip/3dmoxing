@@ -47,7 +47,7 @@ http://3D服务器:8765/?model=白胚GLB&color=%23000000&front=正面图&back=�
 - `title`：显示在左上角的名称
 - `token`：容器设置了 `CUSTOMDIY_BLENDER_TOKEN` 时才需要
 
-预览模式会隐藏颜色/面料/上传面板，自己调本机 Blender 贴图；同一底模 + 颜色 + 效果图组合的结果会缓存到 `output/cache/results/`，第二次打开秒出。没有效果图时走 `GET /api/model?url=` 直接展示白胚。
+预览模式会隐藏颜色/面料/上传面板，自动把大体积白胚压缩为轻量缓存版（`model-lite-v1.glb`，1536px JPEG + Draco 网格压缩），并由 Blender 仅导出几百 KB 的贴片网格（`decals.glb`）与白胚并行加载叠加；同一底模 + 颜色 + 效果图组合的结果会缓存到 `output/cache/results/`，第二次打开秒出。没有效果图时走 `GET /api/model?url=` 重定向到 Nginx 静态缓存的轻量白胚。
 
 售卖设置里的「3D网站地址」必须是客户手机能访问的公网地址，不能填 `127.0.0.1`。
 

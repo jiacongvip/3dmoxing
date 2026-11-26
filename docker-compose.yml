@@ -13,6 +13,7 @@ services:
       CUSTOMDIY_BLENDER_TOKEN: ${CUSTOMDIY_BLENDER_TOKEN:-}
     volumes:
       - ./output:/app/output
+      - ./vendor:/app/vendor
       - ./server.py:/app/server.py
       - ./app.js:/app/app.js
       - ./styles.css:/app/styles.css
