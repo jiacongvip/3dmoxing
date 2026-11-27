@@ -160,7 +160,7 @@ scene.fog = new THREE.Fog('#f1f0eb', 15, 28);
 
 const camera = new THREE.PerspectiveCamera(31, 1, 0.1, 100);
 const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2.5));
 renderer.setSize(sceneHost.clientWidth, sceneHost.clientHeight, false);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -168,8 +168,59 @@ renderer.shadowMap.autoUpdate = false;
 renderer.shadowMap.needsUpdate = true;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.04;
+renderer.toneMappingExposure = 1.02;
 sceneHost.appendChild(renderer.domElement);
+
+const MAX_ANISOTROPY = Math.min(16, renderer.capabilities.getMaxAnisotropy?.() || 1);
+
+function sharpenTexture(texture, isColor = false) {
+  if (!texture) return;
+  if (isColor) texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = MAX_ANISOTROPY;
+  texture.minFilter = THREE.LinearMipmapLinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  texture.needsUpdate = true;
+}
+
+// 内置商业影棚柔光箱 IBL 环境贴图（无外部 HDR 请求，赋予布料真实明暗过渡与细腻光泽）
+function buildStudioEnvironment() {
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  pmrem.compileEquirectangularShader();
+  const envScene = new THREE.Scene();
+  envScene.background = new THREE.Color('#2a2c2f');
+
+  const disposables = [];
+  const addPanel = (color, intensity, size, position, lookAt) => {
+    const geom = new THREE.PlaneGeometry(size[0], size[1]);
+    const mat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(color).multiplyScalar(intensity),
+      side: THREE.DoubleSide,
+    });
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.position.set(position[0], position[1], position[2]);
+    mesh.lookAt(lookAt[0], lookAt[1], lookAt[2]);
+    envScene.add(mesh);
+    disposables.push(geom, mat);
+  };
+
+  // 顶置柔光箱 + 右前主柔光箱 + 左后轮廓灯箱 + 柔和地面反光
+  addPanel('#ffffff', 2.4, [10, 10], [0, 8, 0], [0, 0, 0]);
+  addPanel('#fff8ee', 2.8, [7, 8], [7, 4.5, 7], [0, 2, 0]);
+  addPanel('#dbe9f4', 2.1, [6, 8], [-7.5, 4.2, -5.5], [0, 2, 0]);
+  addPanel('#f4e8d8', 1.1, [6, 6], [-6.5, 2.5, 6], [0, 2, 0]);
+  addPanel('#c9c6be', 0.65, [16, 16], [0, -5, 0], [0, 0, 0]);
+
+  const rt = pmrem.fromScene(envScene, 0.045);
+  disposables.forEach((item) => item.dispose());
+  pmrem.dispose();
+  return rt.texture;
+}
+
+try {
+  scene.environment = buildStudioEnvironment();
+} catch {
+  // 老旧 WebGL 驱动不支持 PMREM 时平滑回退到三点直光
+}
 
 function refreshShadows() {
   renderer.shadowMap.needsUpdate = true;
@@ -186,11 +237,11 @@ controls.maxDistance = 19;
 controls.minPolarAngle = Math.PI * 0.28;
 controls.maxPolarAngle = Math.PI * 0.63;
 
-const hemiLight = new THREE.HemisphereLight('#ffffff', '#9d9a8f', 2.15);
+const hemiLight = new THREE.HemisphereLight('#ffffff', '#7a7770', 0.72);
 scene.add(hemiLight);
 
-const keyLight = new THREE.DirectionalLight('#fff8ed', 3.6);
-keyLight.position.set(4.2, 6.5, 5.2);
+const keyLight = new THREE.DirectionalLight('#fff7eb', 2.45);
+keyLight.position.set(4.4, 6.4, 5.6);
 keyLight.castShadow = true;
 const shadowMapSize = window.innerWidth <= 760 ? 1024 : 2048;
 keyLight.shadow.mapSize.set(shadowMapSize, shadowMapSize);
@@ -202,12 +253,12 @@ keyLight.shadow.bias = -0.00035;
 keyLight.shadow.normalBias = 0.035;
 scene.add(keyLight);
 
-const rimLight = new THREE.DirectionalLight('#c5d9d3', 2.15);
-rimLight.position.set(-4.5, 3.8, -3.5);
+const rimLight = new THREE.DirectionalLight('#d6e6ef', 1.45);
+rimLight.position.set(-4.8, 4.2, -3.8);
 scene.add(rimLight);
 
-const fillLight = new THREE.DirectionalLight('#e3c89f', 1.05);
-fillLight.position.set(-3.5, 2.5, 5.5);
+const fillLight = new THREE.DirectionalLight('#f0dfc8', 0.62);
+fillLight.position.set(-3.8, 2.4, 4.8);
 scene.add(fillLight);
 
 const floor = new THREE.Mesh(
@@ -749,11 +800,15 @@ function prepareDecalMaterials(root) {
     const nodeMaterials = Array.isArray(node.material) ? node.material : [node.material];
     nodeMaterials.forEach((material) => {
       if (!material?.isMaterial) return;
-      if (material.map) material.map.colorSpace = THREE.SRGBColorSpace;
+      sharpenTexture(material.map, true);
+      if ('roughness' in material) material.roughness = 0.8;
+      if ('metalness' in material) material.metalness = 0;
+      if ('envMapIntensity' in material) material.envMapIntensity = 0.55;
       material.depthWrite = false;
       material.polygonOffset = true;
       material.polygonOffsetFactor = -2;
       material.polygonOffsetUnits = -2;
+      material.needsUpdate = true;
     });
   });
 }
@@ -853,7 +908,7 @@ function loadPreviewBaseModel(config, options = {}) {
     hideLoadingOnReady = true,
   } = options;
   return loadGltfUrl(
-    `/api/model?v=2&url=${encodeURIComponent(config.model)}`,
+    `/api/model?v=3&url=${encodeURIComponent(config.model)}`,
     (event) => {
       if (!event.total) return;
       const percent = Math.round((event.loaded / event.total) * 100);
@@ -1059,18 +1114,40 @@ function normalizeModel(root) {
     const nodeMaterials = Array.isArray(node.material) ? node.material : [node.material];
     nodeMaterials.forEach((material) => {
       if (!material?.isMaterial) return;
-      if (material.map) material.map.colorSpace = THREE.SRGBColorSpace;
+      sharpenTexture(material.map, true);
+      sharpenTexture(material.normalMap, false);
+      sharpenTexture(material.roughnessMap, false);
+      sharpenTexture(material.metalnessMap, false);
+      sharpenTexture(material.aoMap, false);
       if (isSideFill || /custom_garment_color/i.test(material.name || '')) {
         material.side = THREE.DoubleSide;
       }
       const materialName = material.name || '';
       if (/^CUSTOM_.*_PATTERN_MATERIAL$/i.test(materialName)) {
+        if ('roughness' in material) material.roughness = 0.8;
+        if ('metalness' in material) material.metalness = 0;
+        if ('envMapIntensity' in material) material.envMapIntensity = 0.55;
         material.depthWrite = false;
         material.polygonOffset = true;
         material.polygonOffsetFactor = -2;
         material.polygonOffsetUnits = -2;
         node.renderOrder = 2;
+      } else {
+        // 强化布料法线褶皱立体感并抑制塑料反光，保留哑光运动面料质感
+        if (material.normalMap && material.normalScale?.set) {
+          material.normalScale.set(1.25, 1.25);
+        }
+        if ('envMapIntensity' in material) material.envMapIntensity = 0.78;
+        if ('roughness' in material) {
+          material.roughness = Math.max(Number(material.roughness ?? 0.85), 0.74);
+        }
+        if ('metalness' in material) {
+          material.metalness = material.metalnessMap
+            ? Math.min(Number(material.metalness ?? 0.2), 0.25)
+            : Math.min(Number(material.metalness ?? 0), 0.04);
+        }
       }
+      material.needsUpdate = true;
     });
   });
 }

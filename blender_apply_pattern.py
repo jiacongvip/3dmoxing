@@ -63,8 +63,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pattern-mask", action="append", default=[], help="2D 蒙版")
     parser.add_argument("--pattern-materials-only", action="append", default=[], help="1=透明底纯素材，不再扣衣")
     parser.add_argument("--pattern-frame", action="append", default=[], help="标定框 x,y,w,h，相对模型包围盒，y 从顶部往下")
-    parser.add_argument("--optimize-base", action="store_true", help="将白胚 GLB 压缩为轻量预览版（缩放贴图 + Draco 压缩）")
-    parser.add_argument("--max-texture-size", type=int, default=1536, help="轻量白胚最大贴图边长")
+    parser.add_argument("--optimize-base", action="store_true", help="将白胚 GLB 压缩为高清轻量预览版（分通道缩放贴图 + 高精度 Draco）")
+    parser.add_argument("--max-texture-size", type=int, default=4096, help="轻量白胚颜色主贴图最大边长")
     parser.add_argument("--decals-only", action="store_true", help="仅导出贴片网格 GLB，不重复导出原白胚")
     parser.add_argument("--draco", action="store_true", help="导出时启用 Draco 网格压缩")
     return parser.parse_args(script_arguments())
@@ -1817,8 +1817,37 @@ def patch_glb_garment_color(path: Path, material_names: list[str], color: str) -
     path.write_bytes(output)
 
 
-def optimize_base_model(input_path: Path, output_path: Path, max_texture_size: int = 1536) -> None:
-    """将原始大白胚压缩为适合手机端秒开的轻量 GLB（自动摆正侧身朝向 + 限制贴图尺寸 + JPEG + Draco 网格压缩）。"""
+def classify_image_channel(image: bpy.types.Image) -> str:
+    """识别贴图用途（albedo / normal / utility），便于分通道保留清晰度。"""
+    lname = (image.name or "").lower()
+    if "normal" in lname or "nrm" in lname or "bump" in lname:
+        return "normal"
+    if any(key in lname for key in ("rough", "metal", "orm", "arm", "_rm", "rm.", "ao", "occlu")):
+        return "utility"
+    for mat in bpy.data.materials:
+        if not mat.use_nodes or not mat.node_tree:
+            continue
+        for node in mat.node_tree.nodes:
+            if node.type != "TEX_IMAGE" or node.image != image:
+                continue
+            for out_sock in node.outputs:
+                for link in out_sock.links:
+                    to_node = link.to_node
+                    to_name = (link.to_socket.name or "").lower()
+                    if to_node.type == "NORMAL_MAP" or "normal" in to_name:
+                        return "normal"
+                    if to_node.type == "SEPARATE_COLOR" or "rough" in to_name or "metal" in to_name:
+                        return "utility"
+                    if "base color" in to_name or "color" in to_name:
+                        return "albedo"
+    cs = (image.colorspace_settings.name or "").lower()
+    if "non-color" in cs or "raw" in cs:
+        return "utility"
+    return "albedo"
+
+
+def optimize_base_model(input_path: Path, output_path: Path, max_texture_size: int = 4096) -> None:
+    """将原始大白胚压缩为高清轻量 GLB（自动摆正朝向 + 分通道高清贴图 + 高精度 Draco 压缩）。"""
     reset_scene()
     target = import_model(input_path)
     up_axis = stand_model_up(target)
@@ -1827,12 +1856,16 @@ def optimize_base_model(input_path: Path, output_path: Path, max_texture_size: i
         rotate_meshes_y(yaw_deg)
     # 仅还原 up_axis，保留正面朝 +Z 的朝向修正
     restore_export_up_axis(up_axis)
-    max_dim = max(512, min(4096, int(max_texture_size)))
+    albedo_max = max(1024, min(4096, int(max_texture_size)))
+    normal_max = min(2048, albedo_max)
+    utility_max = 1024
     scaled_count = 0
     for image in bpy.data.images:
         width, height = int(image.size[0]), int(image.size[1])
         if width <= 0 or height <= 0:
             continue
+        channel = classify_image_channel(image)
+        max_dim = albedo_max if channel == "albedo" else (normal_max if channel == "normal" else utility_max)
         longest = max(width, height)
         if longest > max_dim:
             ratio = max_dim / float(longest)
@@ -1840,7 +1873,7 @@ def optimize_base_model(input_path: Path, output_path: Path, max_texture_size: i
             new_h = max(1, int(round(height * ratio)))
             image.scale(new_w, new_h)
             scaled_count += 1
-            print("BASE_IMG_SCALED", image.name, f"{width}x{height}->{new_w}x{new_h}")
+            print("BASE_IMG_SCALED", channel, image.name, f"{width}x{height}->{new_w}x{new_h}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result = bpy.ops.export_scene.gltf(
         filepath=str(output_path.resolve()),
@@ -1849,12 +1882,12 @@ def optimize_base_model(input_path: Path, output_path: Path, max_texture_size: i
         export_apply=False,
         export_materials="EXPORT",
         export_image_format="JPEG",
-        export_image_quality=82,
+        export_image_quality=90,
         export_draco_mesh_compression_enable=True,
         export_draco_mesh_compression_level=6,
-        export_draco_position_quantization=11,
-        export_draco_normal_quantization=8,
-        export_draco_texcoord_quantization=10,
+        export_draco_position_quantization=12,
+        export_draco_normal_quantization=10,
+        export_draco_texcoord_quantization=12,
     )
     if "FINISHED" not in result:
         raise RuntimeError("Base GLB optimization failed")
@@ -1881,9 +1914,9 @@ def export_decals_only(path: Path, decal_objects: list[bpy.types.Object]) -> Non
         export_image_format="AUTO",
         export_draco_mesh_compression_enable=True,
         export_draco_mesh_compression_level=6,
-        export_draco_position_quantization=12,
-        export_draco_normal_quantization=8,
-        export_draco_texcoord_quantization=12,
+        export_draco_position_quantization=13,
+        export_draco_normal_quantization=10,
+        export_draco_texcoord_quantization=13,
     )
     if "FINISHED" not in result:
         raise RuntimeError("Decals GLB export failed")
